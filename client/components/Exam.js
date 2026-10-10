@@ -1,0 +1,368 @@
+'use client';
+// One question at a time display - verified working - Fresh deployment
+import { useEffect, useRef, useState } from 'react';
+import { api } from '../lib/api';
+import { Proctor } from '../lib/proctor';
+import SpotlightQuestion from './SpotlightQuestion';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const xml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+export default function Exam({ ex, onDone }) {
+  // All fast-changing exam state lives in one ref; `rerender` repaints. (Keeps timers/handlers free of stale closures.)
+  const R = useRef(null);
+  const [isMobile, setIsMobile] = useState(false);
+  
+  // Get spotlight settings from hackathon or use defaults
+  const beamRadius = ex.spotlight_beam_radius ?? 250;
+  const softness = ex.spotlight_softness ?? 0.35;
+  
+  useEffect(() => {
+    const checkMobile = () => setIsMobile(window.innerWidth <= 768);
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+  
+  if (R.current === null) R.current = { 
+    ans: { ...ex.saved }, 
+    pend: new Map(), 
+    flushing: false, 
+    finished: false, 
+    left: ex.seconds_left, 
+    violations: ex.violations, 
+    timer: null, 
+    hb: null,
+    currentQuestion: 0,
+    // First 20 questions = AWS (15s), Last 10 = Aptitude (27s)
+    questionTimers: ex.questions.map((q, i) => i < 20 ? 15 : 27),
+    questionTimeLeft: ex.questions.map((q, i) => i < 20 ? 15 : 27),
+    answeredQuestions: new Set() // Track which questions have been answered
+  };
+  const [, setTick] = useState(0);
+  const rerender = () => setTick((n) => n + 1);
+  const [toast, setToast] = useState('');
+  const [dim, setDim] = useState(false);
+  const [fsLost, setFsLost] = useState(false);
+  const lsk = `pend:${ex.pid}`;
+
+  const flash = (m) => { setToast(m); setTimeout(() => setToast(''), 4000); };
+  const persist = () => { try { localStorage.setItem(lsk, JSON.stringify([...R.current.pend])); } catch {} rerender(); };
+
+  // Answers are saved one at a time with retries; whatever is still unsent is backed up in localStorage and re-sent.
+  async function flushAns() {
+    const s = R.current;
+    if (s.flushing) return;
+    s.flushing = true;
+    try {
+      for (const [qid, sel] of [...s.pend]) {
+        await api('/exam/answer', { method: 'POST', body: { question_id: qid, selected: sel }, retries: 1 });
+        if (s.pend.get(qid) === sel) s.pend.delete(qid);
+      }
+    } catch {} finally { s.flushing = false; persist(); }
+  }
+
+  function choose(qid, key) { 
+    const s = R.current; 
+    s.ans[qid] = key; 
+    s.pend.set(qid, key); 
+    persist(); 
+    flushAns(); 
+  }
+  
+  function markDone() {
+    const s = R.current;
+    const currentQ = ex.questions[s.currentQuestion];
+    if (s.ans[currentQ.id]) {
+      s.answeredQuestions.add(s.currentQuestion);
+      // Auto-advance to next unanswered question
+      if (s.currentQuestion < ex.questions.length - 1) {
+        s.currentQuestion += 1;
+        s.questionTimeLeft[s.currentQuestion] = s.questionTimers[s.currentQuestion];
+      }
+      rerender();
+    }
+  }
+  
+  function canAccessQuestion(index) {
+    const s = R.current;
+    // Can only access current question or future questions that haven't been started
+    // Cannot access if: answered, time expired, or it's a past question
+    if (s.answeredQuestions.has(index)) return false; // Already answered and locked
+    if (s.questionTimeLeft[index] === 0 && index !== s.currentQuestion) return false; // Timer expired
+    if (index > s.currentQuestion) return false; // Future question not yet reached
+    return true; // Current question
+  }
+
+  async function finish() {
+    const s = R.current;
+    if (s.finished) return;
+    s.finished = true; clearInterval(s.timer); clearInterval(s.hb);
+    for (let i = 0; i < 6; i++) {                             // backoff: survives a brief server hiccup
+      try { await api('/exam/submit', { method: 'POST', body: { answers: s.ans }, retries: 0 }); try { localStorage.removeItem(lsk); } catch {} break; }
+      catch (e) { if (/No active attempt/.test(e.message)) break; await sleep(800 * 2 ** i + Math.random() * 500); }
+    }
+    Proctor.stop(true); onDone();
+  }
+
+  useEffect(() => {
+    const s = R.current;
+    try { JSON.parse(localStorage.getItem(lsk) || '[]').forEach(([k, v]) => { if (s.ans[k] !== v) { s.ans[k] = v; s.pend.set(k, v); } }); } catch {}
+    if (s.pend.size) flushAns();
+    s.timer = setInterval(() => { 
+      s.left -= 1; 
+      
+      // Decrease time for current question
+      if (s.questionTimeLeft[s.currentQuestion] > 0) {
+        s.questionTimeLeft[s.currentQuestion] -= 1;
+        
+        // Auto-advance to next question when time runs out
+        if (s.questionTimeLeft[s.currentQuestion] === 0) {
+          // Mark current question as locked due to timeout
+          if (!s.answeredQuestions.has(s.currentQuestion)) {
+            s.answeredQuestions.add(s.currentQuestion); // Lock it
+          }
+          
+          // Move to next question if available
+          if (s.currentQuestion < ex.questions.length - 1) {
+            s.currentQuestion += 1;
+            // Reset timer for next question
+            s.questionTimeLeft[s.currentQuestion] = s.questionTimers[s.currentQuestion];
+          }
+        }
+      }
+      
+      if (s.left <= 0) { flash('Time is up – submitting'); finish(); } 
+      rerender(); 
+    }, 1000);
+    // heartbeat ~every 10 s with a per-client random period, so thousands of browsers drift apart instead of syncing up
+    s.hb = setInterval(async () => {
+      if (s.pend.size) flushAns();
+      try { const r = await api('/exam/heartbeat', { method: 'POST', retries: 0 }); if (r.ok) s.left = r.seconds_left; } catch {}
+    }, 10000 + Math.floor(Math.random() * 1500));
+    Proctor.start({
+      onFocusLost: () => setDim(true), onFocusBack: () => setDim(false),
+      onFullscreenLost: () => setFsLost(true), onFullscreenBack: () => setFsLost(false),
+      onViolation: async (type, desc) => {
+        if (s.finished) return;
+        s.violations += 1; flash(`Violation: ${desc}`); rerender();
+        try {
+          const r = await api('/exam/violation', { method: 'POST', body: { event_type: type, description: desc }, retries: 1 });
+          if (r.auto_submitted) { s.finished = true; clearInterval(s.timer); clearInterval(s.hb); Proctor.stop(true); flash('Max violations – exam auto-submitted'); setTimeout(onDone, 1500); }
+        } catch {}
+      },
+    });
+    return () => { clearInterval(s.timer); clearInterval(s.hb); Proctor.stop(false); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const s = R.current;
+  const answered = Object.values(s.ans).filter(Boolean).length, left = Math.max(0, s.left);
+  const wm = `<svg xmlns='http://www.w3.org/2000/svg' width='340' height='200'><text x='170' y='100' text-anchor='middle' transform='rotate(-25 170 100)' font-size='16' font-family='sans-serif' fill='rgba(128,128,128,0.22)'>${xml(ex.name)} · ${xml(ex.pid)}</text></svg>`;
+  
+  const currentQ = ex.questions[s.currentQuestion];
+  const subject = (currentQ.subject || 'general').toLowerCase();
+  const timeForQuestion = s.questionTimeLeft[s.currentQuestion];
+  const isLowTime = timeForQuestion <= 5;
+  
+  // Determine current section
+  const isSection1 = s.currentQuestion < 20; // First 20 are AWS
+  const currentSection = isSection1 ? 1 : 2;
+  const sectionName = isSection1 ? 'AWS Questions' : 'Aptitude Questions';
+
+  return (
+    <div className={`exam${dim ? ' dim' : ''}`}>
+      <div className="wm" style={{ backgroundImage: `url("data:image/svg+xml,${encodeURIComponent(wm)}")` }} />
+      
+      {/* Top Bar with AWS Logo */}
+      <div className="bar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 20px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <img src="https://aws-codeathon-at-gist-site.vercel.app/assets/aws-logo.png" alt="AWS" style={{ height: 32, maxWidth: 120 }} />
+          <span style={{ fontSize: 18, fontWeight: 'bold' }}>- Codeathon</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 20, flexWrap: 'wrap' }}>
+          <span style={{ whiteSpace: 'nowrap' }}><b>Sec {currentSection}</b> · Q {s.currentQuestion + 1}/{ex.questions.length}</span>
+          <span style={{ whiteSpace: 'nowrap' }}>Ans <b>{answered}</b>/{ex.questions.length}</span>
+          <span className="mu" style={{ whiteSpace: 'nowrap' }}>{s.pend.size ? 'Saving…' : '✓'}</span>
+          <span style={{ whiteSpace: 'nowrap' }}>Viol <span className="v">{s.violations}</span>/{ex.max_violations || '∞'}</span>
+          <span className="mono" style={{ whiteSpace: 'nowrap' }}>{Math.floor(left / 60)}:{String(left % 60).padStart(2, '0')}</span>
+          <button onClick={() => { const un = ex.questions.length - answered; if (!un || confirm(`${un} unanswered. Submit anyway?`)) finish(); }}>Submit</button>
+        </div>
+      </div>
+      
+      <div style={{ display: 'flex', gap: 16, padding: '0 20px 20px', flexDirection: isMobile ? 'column' : 'row' }}>
+        {/* Main question area */}
+        <div className="wrap" style={{ flex: 1, maxWidth: '100%', margin: 0, padding: isMobile ? '0' : '20px' }}>
+          {/* Question Timer - Outside spotlight */}
+          <div style={{ 
+            marginBottom: 16, 
+            display: 'flex', 
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            padding: '12px 20px',
+            background: isLowTime ? '#ff6b6b' : '#4CAF50',
+            color: 'white',
+            borderRadius: '8px',
+            fontWeight: 'bold',
+            fontSize: isMobile ? 18 : 22,
+            border: '2px solid white',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)'
+          }}>
+            <div style={{ fontSize: isMobile ? 14 : 16 }}>
+              {sectionName} - Question {isSection1 ? s.currentQuestion + 1 : s.currentQuestion - 19}
+            </div>
+            <div style={{ 
+              fontSize: isMobile ? 20 : 26,
+              minWidth: isMobile ? 70 : 90,
+              textAlign: 'center'
+            }}>
+              {timeForQuestion}s
+            </div>
+          </div>
+
+          {/* Spotlight Question Canvas */}
+          <div className="card" style={{ 
+            border: '2px solid white',
+            borderTop: '4px solid #FF9800',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+            padding: 0,
+            overflow: 'hidden'
+          }}>
+            <SpotlightQuestion
+              question={currentQ}
+              onSelectOption={(key) => choose(currentQ.id, key)}
+              selectedOption={s.ans[currentQ.id]}
+              studentLabel={`${ex.pid} · ${ex.name}`}
+              beamRadius={beamRadius}
+              softness={softness}
+            />
+            {/* Show Done button when answer is selected */}
+            {s.ans[currentQ.id] && !s.answeredQuestions.has(s.currentQuestion) && (
+              <div style={{ padding: '0 20px 20px' }}>
+                <button 
+                  onClick={markDone}
+                  style={{ 
+                    width: '100%', 
+                    padding: isMobile ? '12px' : '14px',
+                    fontSize: isMobile ? 14 : 16,
+                    fontWeight: 'bold',
+                    background: '#4CAF50',
+                    color: 'white',
+                    border: '2px solid white'
+                  }}
+                >
+                  Done - Next Question →
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+        
+        {/* Question navigator on right */}
+        <div style={{ width: isMobile ? '100%' : 240, flexShrink: 0 }}>
+          <div className="card" style={{ 
+            position: isMobile ? 'static' : 'sticky', 
+            top: 16,
+            border: '2px solid white',
+            borderTop: '4px solid #FF9800'
+          }}>
+            <h3 style={{ marginBottom: 16, fontSize: isMobile ? 14 : 16, fontWeight: 'bold' }}>Question Navigator</h3>
+            
+            {/* Section 1: AWS Questions */}
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 13, fontWeight: 'bold', marginBottom: 8, color: '#666' }}>
+                Section 1: AWS (1-20)
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6 }}>
+                {ex.questions.slice(0, 20).map((q, i) => {
+                  const isLocked = s.answeredQuestions.has(i) || (s.questionTimeLeft[i] === 0 && i !== s.currentQuestion);
+                  return (
+                    <button
+                      key={q.id}
+                      onClick={() => { if (canAccessQuestion(i)) { s.currentQuestion = i; rerender(); } }}
+                      disabled={!canAccessQuestion(i)}
+                      style={{
+                        padding: '10px 4px',
+                        fontSize: 13,
+                        fontWeight: i === s.currentQuestion ? 'bold' : 'normal',
+                        background: isLocked ? '#888' : i === s.currentQuestion ? '#FF9800' : s.ans[q.id] ? '#4CAF50' : '#f5f5f5',
+                        color: isLocked || i === s.currentQuestion || s.ans[q.id] ? 'white' : '#333',
+                        border: '2px solid white',
+                        borderRadius: 4,
+                        cursor: canAccessQuestion(i) ? 'pointer' : 'not-allowed',
+                        opacity: canAccessQuestion(i) ? 1 : 0.5
+                      }}
+                      title={isLocked ? 'Locked (time expired or completed)' : ''}
+                    >
+                      {i + 1}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            
+            {/* Section 2: Aptitude Questions */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 13, fontWeight: 'bold', marginBottom: 8, color: '#666' }}>
+                Section 2: Aptitude (21-30)
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6 }}>
+                {ex.questions.slice(20, 30).map((q, i) => {
+                  const actualIndex = i + 20;
+                  const isLocked = s.answeredQuestions.has(actualIndex) || (s.questionTimeLeft[actualIndex] === 0 && actualIndex !== s.currentQuestion);
+                  return (
+                    <button
+                      key={q.id}
+                      onClick={() => { if (canAccessQuestion(actualIndex)) { s.currentQuestion = actualIndex; rerender(); } }}
+                      disabled={!canAccessQuestion(actualIndex)}
+                      style={{
+                        padding: '10px 4px',
+                        fontSize: 13,
+                        fontWeight: actualIndex === s.currentQuestion ? 'bold' : 'normal',
+                        background: isLocked ? '#888' : actualIndex === s.currentQuestion ? '#FF9800' : s.ans[q.id] ? '#4CAF50' : '#f5f5f5',
+                        color: isLocked || actualIndex === s.currentQuestion || s.ans[q.id] ? 'white' : '#333',
+                        border: '2px solid white',
+                        borderRadius: 4,
+                        cursor: canAccessQuestion(actualIndex) ? 'pointer' : 'not-allowed',
+                        opacity: canAccessQuestion(actualIndex) ? 1 : 0.5
+                      }}
+                      title={isLocked ? 'Locked (time expired or completed)' : ''}
+                    >
+                      {actualIndex + 1}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            
+            <div style={{ marginTop: 20, fontSize: 12, color: '#666', paddingTop: 16, borderTop: '2px solid white' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <div style={{ width: 16, height: 16, background: '#4CAF50', borderRadius: 2, border: '1px solid white' }}></div>
+                <span>Selected</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <div style={{ width: 16, height: 16, background: '#888', borderRadius: 2, border: '1px solid white' }}></div>
+                <span>Locked (timer expired)</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <div style={{ width: 16, height: 16, background: '#FF9800', borderRadius: 2, border: '1px solid white' }}></div>
+                <span>Current</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{ width: 16, height: 16, background: '#f5f5f5', border: '2px solid white', borderRadius: 2, opacity: 0.5 }}></div>
+                <span>Not answered</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      {fsLost && (
+        <div className="overlay"><div>
+          <h1>Fullscreen required</h1><p>Leaving fullscreen was recorded as a violation.</p>
+          <button onClick={() => Proctor.enterFullscreen()}>Return to fullscreen</button>
+        </div></div>
+      )}
+      {toast && <div className="toast">{toast}</div>}
+    </div>
+  );
+}
